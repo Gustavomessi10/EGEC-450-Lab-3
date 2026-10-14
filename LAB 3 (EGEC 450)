@@ -1,0 +1,219 @@
+# Instructions:
+# 1. Type your response to each question below the question's heading;
+#    i.e., write question 1's response below "** Question 1:"
+# 2. Do not modify this template;
+#    this may result in your submission not being graded and a score of 0.
+# 3. Do not change the file type of this file; i.e., do not change to rich text,
+#    a Word document, PDF, etc.  You will submit this text file, as a .txt file,
+#    on Canvas for this homework assignment.
+
+** Question 1:
+
+#include <msp430.h>
+#include <stdint.h>
+
+// --- Global Variables ---
+volatile uint32_t elapsed_ms = 0;       // Total stopwatch elapsed time in milliseconds
+volatile uint8_t is_running = 0;        // Stopwatch state flag: 1 = running, 0 = stopped
+volatile uint8_t current_digit = 0;     // Time-multiplexing digit counter (0 to 3)
+volatile uint32_t system_ticks = 0;     // System tick counter for debouncing (1 ms ticks)
+
+// Bit-pattern encoding for 7-segment display (0-9) [Active HIGH segments: DP g f e d c b a]
+const uint8_t SEGMENT_MAP[10] = {
+    0x3F, // 0
+    0x06, // 1
+    0x5B, // 2
+    0x4F, // 3
+    0x66, // 4
+    0x6D, // 5
+    0x7D, // 6
+    0x07, // 7
+    0x7F, // 8
+    0x6F  // 9
+};
+
+// --- Hardware Pin Definitions ---
+#define RCLK_PIN    BIT0   // P1.0 -> Register Latch Clock (SN74HC595)
+#define BTN_START   BIT1   // P1.1 -> Start Button
+#define BTN_STOP    BIT2   // P1.2 -> Stop Button
+#define BTN_INC     BIT3   // P1.3 -> Increment Button
+#define BTN_RESET   BIT4   // P1.4 -> Reset Button
+
+#define DIGIT_0_PIN BIT0   // P2.0 -> Digit 0 Enable (LSB - 1ms)
+#define DIGIT_1_PIN BIT1   // P2.1 -> Digit 1 Enable (10ms)
+#define DIGIT_2_PIN BIT2   // P2.2 -> Digit 2 Enable (100ms)
+#define DIGIT_3_PIN BIT3   // P2.3 -> Digit 3 Enable (MSB - 1s)
+
+// --- Function Prototypes ---
+void init_system(void);
+void spi_send_byte(uint8_t data);
+void update_display_digit(uint8_t digit_index);
+
+int main(void) {
+    WDTCTL = WDTPW | HOLD; // Stop Watchdog Timer
+    init_system();
+    __enable_interrupt();  // Enable global interrupts
+
+    while (1) {
+        // Main loop enters low-power sleep; execution is purely interrupt-driven
+        __low_power_mode_0();
+    }
+}
+
+void init_system(void) {
+    // 1. Clock Configuration (1 MHz SMCLK)
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL = CALDCO_1MHZ;
+
+    // 2. GPIO Output Setup (Latch Pin & Digit Control Pins)
+    P1DIR |= RCLK_PIN;
+    P1OUT &= ~RCLK_PIN;
+    
+    P2DIR |= (DIGIT_0_PIN | DIGIT_1_PIN | DIGIT_2_PIN | DIGIT_3_PIN);
+    P2OUT &= ~(DIGIT_0_PIN | DIGIT_1_PIN | DIGIT_2_PIN | DIGIT_3_PIN); // Turn off digits
+
+    // 3. SPI Hardware Configuration (UCB0 SPI Master Mode)
+    P1SEL |= BIT5 | BIT7;  // P1.5 = UCB0CLK (SRCLK), P1.7 = UCB0SIMO (SER)
+    P1SEL2 |= BIT5 | BIT7;
+    UCB0CTL1 |= UCSWRST;
+    UCB0CTL0 |= UCCKPH | UCMSB | UCMST | UCSYNC; // MSB first, Master, Synchronous
+    UCB0CTL1 |= UCSSEL_2;  // SMCLK source
+    UCB0BR0 = 1;           // Prescaler = 1
+    UCB0BR1 = 0;
+    UCB0CTL1 &= ~UCSWRST;  // Release SPI reset
+
+    // 4. Button GPIO Interrupt Configuration (Internal Pull-Up Resistors)
+    P1DIR &= ~(BTN_START | BTN_STOP | BTN_INC | BTN_RESET);
+    P1REN |= (BTN_START | BTN_STOP | BTN_INC | BTN_RESET);
+    P1OUT |= (BTN_START | BTN_STOP | BTN_INC | BTN_RESET);  // Pull-up active
+    P1IES |= (BTN_START | BTN_STOP | BTN_INC | BTN_RESET);  // High-to-Low transition
+    P1IFG &= ~(BTN_START | BTN_STOP | BTN_INC | BTN_RESET); // Clear flags
+    P1IE |= (BTN_START | BTN_STOP | BTN_INC | BTN_RESET);  // Enable button interrupts
+
+    // 5. Timer0_A Configuration (1 ms Periodic Interrupt for Stopwatch & Multiplexing)
+    TA0CCR0 = 1000 - 1;    // 1000 cycles @ 1MHz = 1 ms
+    TA0CCTL0 = CCIE;       // Capture/Compare Interrupt Enable
+    TA0CTL = TASSEL_2 + MC_1; // SMCLK, Up mode
+}
+
+void spi_send_byte(uint8_t data) {
+    while (!(IFG2 & UCB0TXIFG)); // Wait until SPI transmit buffer is ready
+    UCB0TXBUF = data;            // Shift byte out to SN74HC595
+    while (UCB0STAT & UCBUSY);   // Wait for transfer complete
+    
+    // Latch data to output registers (pulse RCLK HIGH then LOW)
+    P1OUT |= RCLK_PIN;
+    P1OUT &= ~RCLK_PIN;
+}
+
+void update_display_digit(uint8_t digit_index) {
+    // Disable digit outputs to eliminate ghosting artifacts
+    P2OUT &= ~(DIGIT_0_PIN | DIGIT_1_PIN | DIGIT_2_PIN | DIGIT_3_PIN);
+
+    uint8_t digit_value = 0;
+    uint8_t segment_pattern = 0;
+
+    // Calculate digit value based on elapsed_ms
+    switch (digit_index) {
+        case 0: // Right-most digit: 1ms resolution (elapsed_ms % 10)
+            digit_value = (elapsed_ms / 1) % 10;
+            segment_pattern = SEGMENT_MAP[digit_value];
+            break;
+        case 1: // Tens of ms digit (elapsed_ms / 10 % 10)
+            digit_value = (elapsed_ms / 10) % 10;
+            segment_pattern = SEGMENT_MAP[digit_value];
+            break;
+        case 2: // Hundreds of ms digit (elapsed_ms / 100 % 10)
+            digit_value = (elapsed_ms / 100) % 10;
+            segment_pattern = SEGMENT_MAP[digit_value];
+            break;
+        case 3: // Left-most digit: Seconds digit with Decimal Point
+            digit_value = (elapsed_ms / 1000) % 10;
+            segment_pattern = SEGMENT_MAP[digit_value] | 0x80; // Set DP bit (Bit 7)
+            break;
+    }
+
+    // Output segment bit pattern via SPI shift register
+    spi_send_byte(segment_pattern);
+
+    // Enable current digit transistor/line
+    switch (digit_index) {
+        case 0: P2OUT |= DIGIT_0_PIN; break;
+        case 1: P2OUT |= DIGIT_1_PIN; break;
+        case 2: P2OUT |= DIGIT_2_PIN; break;
+        case 3: P2OUT |= DIGIT_3_PIN; break;
+    }
+}
+
+// --- Timer0_A Interrupt Service Routine (1 ms Period) ---
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer_A_ISR(void) {
+    system_ticks++; // Increment tick counter for debouncing
+
+    // 1. Increment time if stopwatch is running
+    if (is_running) {
+        elapsed_ms++;
+    }
+
+    // 2. Time-multiplex the 7-segment display (refresh 1 digit per ms)
+    update_display_digit(current_digit);
+    current_digit = (current_digit + 1) % 4; // Advance to next digit (0-3)
+}
+
+// --- Port 1 Button Interrupt Service Routine ---
+#pragma vector = PORT1_VECTOR
+__interrupt void Port_1_ISR(void) {
+    static uint32_t last_button_tick = 0;
+
+    // Software Debounce: Ignore button triggers within 50 ms of previous press
+    if ((system_ticks - last_button_tick) > 50) {
+        // 1. Start Button
+        if ((P1IFG & BTN_START) && !(P1IN & BTN_START)) {
+            if (!is_running) {
+                is_running = 1; // Start counting if stopped
+            }
+        }
+        // 2. Stop Button
+        else if ((P1IFG & BTN_STOP) && !(P1IN & BTN_STOP)) {
+            if (is_running) {
+                is_running = 0; // Stop counting if running
+            }
+        }
+        // 3. Increment Button
+        else if ((P1IFG & BTN_INC) && !(P1IN & BTN_INC)) {
+            if (!is_running) {
+                elapsed_ms++;   // Manual 1 ms increment if stopped
+            }
+        }
+        // 4. Reset Button
+        else if ((P1IFG & BTN_RESET) && !(P1IN & BTN_RESET)) {
+            is_running = 0;     // Stop stopwatch
+            elapsed_ms = 0;     // Reset time to zero
+        }
+        last_button_tick = system_ticks;
+    }
+
+    P1IFG &= ~(BTN_START | BTN_STOP | BTN_INC | BTN_RESET); // Clear pin interrupt flags
+}
+
+** Question 2:
+
+The device driver communicates with the display by sending 8-bit segment bit patterns serially via SPI to an SN74HC595 shift register, which latches and converts the serial data into parallel outputs 
+driving the display segments. Time-multiplexing is managed by a periodic 1 ms timer interrupt that continuously cycles through each digit position—transmitting that digit's encoded bitmask over SPI 
+and momentarily activating its corresponding digit enable line—using human persistence of vision to create a flicker-free four-digit readout.
+
+** Question 3:
+
+The system uses two interrupts: a 1 ms timer interrupt to advance the millisecond counter and drive display multiplexing, and a GPIO port interrupt to process debounced button inputs for Start, Stop,
+Increment, and Reset. It relies on four global variables to coordinate these interrupts: elapsed_ms to store total time, is_running to track active status, current_digit to index multiplexing, and 
+system_ticks to manage button debounce timing.
+
+** Question 4:
+
+SRCLK is controlled automatically by the hardware SPI clock to shift bits serially into the shift register, while RCLK is toggled via a GPIO output pin in software to latch the completed byte onto the
+output registers. Controlling RCLK separately keeps the display outputs static during serial data transfers, preventing unwanted visual noise or segment flickering while bits are actively being 
+shifted in.
+
+** Question 5:
+
+Submit video demonstration using the separate Canvas submission link
